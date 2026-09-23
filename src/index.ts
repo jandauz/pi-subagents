@@ -25,6 +25,7 @@ import { inChildSessionContext } from "./child-context.js";
 import { type RpcHandle, registerRpcHandlers } from "./cross-extension-rpc.js";
 import { loadCustomAgents } from "./custom-agents.js";
 import { GroupJoinManager } from "./group-join.js";
+import { selectExact } from "./exact-selection.js";
 import { isolationParam, resolveAgentInvocationConfig, resolveJoinMode } from "./invocation-config.js";
 import { describeMention, handleBase, isReservedHandle, parseMention, resolveHandleToType, stripAgentPrefix } from "./mention.js";
 import { runMentionClone } from "./mention-clone.js";
@@ -1802,14 +1803,20 @@ Terse command-style prompts produce shallow, generic work.
       // Get agent config (if any)
       const customConfig = getAgentConfig(subagentType);
 
+      let exactSelection: ReturnType<typeof selectExact> | undefined;
+      if (customConfig?.requireExactSelection) {
+        if (params.resume || params.schedule) return textResult("Exact-selection roles require a fresh unscheduled spawn");
+        try { exactSelection = selectExact(customConfig, params.model, params.thinking, ctx.modelRegistry); }
+        catch (error) { return textResult(error instanceof Error ? error.message : String(error)); }
+      }
       const resolvedConfig = resolveAgentInvocationConfig(customConfig, params, {
         worktreeAllowed: isWorktreeIsolationEnabled(),
         defaultRunInBackground: getBackgroundByDefault(),
       });
 
       // Resolve model from agent config first; tool-call params only fill gaps.
-      let model = ctx.model;
-      if (resolvedConfig.modelInput) {
+      let model = exactSelection?.model ?? ctx.model;
+      if (!exactSelection && resolvedConfig.modelInput) {
         const resolved = resolveModel(resolvedConfig.modelInput, ctx.modelRegistry);
         if (typeof resolved === "string") {
           if (resolvedConfig.modelFromParams) return textResult(resolved);
@@ -1826,14 +1833,14 @@ Terse command-style prompts produce shallow, generic work.
         model,
         cwd: ctx.cwd,
         modelRegistry: ctx.modelRegistry,
-        callerSupplied: resolvedConfig.modelFromParams,
+        callerSupplied: !!exactSelection || resolvedConfig.modelFromParams,
         agentLabel: customConfig?.displayName ?? subagentType,
         modelInput: resolvedConfig.modelInput,
       });
       if (scopeVerdict.kind === "error") return textResult(scopeVerdict.message);
       if (scopeVerdict.kind === "warn") ctx.ui.notify(scopeVerdict.message, "warning");
 
-      const thinking = resolvedConfig.thinking;
+      const thinking = exactSelection?.thinking ?? resolvedConfig.thinking;
       const inheritContext = resolvedConfig.inheritContext;
       const runInBackground = resolvedConfig.runInBackground;
       const isolated = resolvedConfig.isolated;
@@ -1970,6 +1977,7 @@ Terse command-style prompts produce shallow, generic work.
       // Resume existing agent
       if (params.resume) {
         const existing = manager.getRecord(params.resume);
+        if (existing && getAgentConfig(existing.type)?.requireExactSelection) return textResult("Exact-selection roles cannot resume; create an approved fresh spawn");
         if (!existing || !isTopLevelAgent(existing)) {
           return textResult(`Agent not found: "${params.resume}". It may have been cleaned up.`);
         }

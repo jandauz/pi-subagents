@@ -13,6 +13,7 @@ const {
   sessionManagerOpen,
   settingsManagerCreate,
   settingsManagerGetSessionDir,
+  settingsManagerApplyOverrides,
 } = vi.hoisted(() => ({
   createAgentSession: vi.fn(),
   defaultResourceLoaderCtor: vi.fn(),
@@ -28,7 +29,8 @@ const {
   sessionManagerCreate: vi.fn(() => ({ kind: "persistent-session-manager" })),
   sessionManagerOpen: vi.fn(() => ({ kind: "reopened-session-manager" })),
   settingsManagerGetSessionDir: vi.fn(() => undefined as string | undefined),
-  settingsManagerCreate: vi.fn(() => ({ kind: "settings-manager", getSessionDir: settingsManagerGetSessionDir })),
+  settingsManagerApplyOverrides: vi.fn(),
+  settingsManagerCreate: vi.fn(() => ({ kind: "settings-manager", getSessionDir: settingsManagerGetSessionDir, applyOverrides: settingsManagerApplyOverrides })),
 }));
 
 vi.mock("@earendil-works/pi-coding-agent", () => ({
@@ -212,6 +214,7 @@ beforeEach(() => {
   settingsManagerGetSessionDir.mockReset();
   settingsManagerGetSessionDir.mockReturnValue(undefined);
   settingsManagerCreate.mockClear();
+  settingsManagerApplyOverrides.mockClear();
   vi.mocked(createNestedSubagentTools).mockClear();
   loaderExtensionsRef.current = { extensions: [], errors: [], runtime: {} };
   lastSession = undefined;
@@ -1437,7 +1440,7 @@ describe("agent-runner master tool allowlist", () => {
   it("suppresses nested tools in isolated mode even when opted in", async () => {
     vi.mocked(getConfig).mockReturnValueOnce(makeConfig({ extensions: false }));
     vi.mocked(getAgentConfig).mockReturnValueOnce(
-      makeAgentConfig({ extensions: false, allowedSubagents: "all" }),
+      makeAgentConfig({ extensions: false, allowedSubagents: "all", isolated: undefined }),
     );
     vi.mocked(getToolNamesForType).mockReturnValueOnce(BUILTINS_7);
     const { session } = createSession("OK");
@@ -1451,6 +1454,58 @@ describe("agent-runner master tool allowlist", () => {
 
     expect(createNestedSubagentTools).not.toHaveBeenCalled();
     expect(lastToolsPassed()).not.toContain("Agent");
+  });
+
+  it("definition isolated:true beats caller false and suppresses nested and extension tools", async () => {
+    vi.mocked(getConfig).mockReturnValueOnce(makeConfig({ extensions: true }));
+    vi.mocked(getAgentConfig).mockReturnValueOnce(
+      makeAgentConfig({ isolated: true, extensions: true, extSelectors: ["ext:foo"], allowedSubagents: "all" }),
+    );
+    vi.mocked(getToolNamesForType).mockReturnValueOnce(["read"]);
+    withExtensions({ "/ext/foo.ts": ["foo_tool"] });
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+
+    await runAgent(ctx, "Explore", "go", {
+      pi,
+      isolated: false,
+      nestedRuntime: { manager: {} as any, parentAgentId: "parent", depth: 1 },
+    });
+
+    expect(lastLoaderOpts().noExtensions).toBe(true);
+    expect(createNestedSubagentTools).not.toHaveBeenCalled();
+    expect(lastToolsPassed()).toContain("read");
+    expect(lastToolsPassed()).not.toContain("Agent");
+    expect(lastToolsPassed()).not.toContain("foo_tool");
+    expect(settingsManagerApplyOverrides).toHaveBeenCalledOnce();
+    expect(settingsManagerApplyOverrides).toHaveBeenCalledWith({
+      compaction: { enabled: false },
+      retry: { enabled: false, maxRetries: 0, provider: { maxRetries: 0 } },
+    });
+  });
+
+  it("definition isolated:false beats caller true and allows configured nested and extension tools", async () => {
+    vi.mocked(getConfig).mockReturnValueOnce(makeConfig({ extensions: true }));
+    vi.mocked(getAgentConfig).mockReturnValueOnce(
+      makeAgentConfig({ isolated: false, extensions: true, extSelectors: ["ext:foo"], allowedSubagents: "all" }),
+    );
+    vi.mocked(getToolNamesForType).mockReturnValueOnce(["read"]);
+    withExtensions({ "/ext/foo.ts": ["foo_tool"] });
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+
+    await runAgent(ctx, "Explore", "go", {
+      pi,
+      isolated: true,
+      nestedRuntime: { manager: {} as any, parentAgentId: "parent", depth: 1 },
+    });
+
+    expect(lastLoaderOpts().noExtensions).toBe(false);
+    expect(createNestedSubagentTools).toHaveBeenCalledTimes(1);
+    expect(settingsManagerApplyOverrides).not.toHaveBeenCalled();
+    expect(lastToolsPassed()).toContain("read");
+    expect(lastToolsPassed()).toContain("Agent");
+    expect(lastToolsPassed()).toContain("foo_tool");
   });
 
   it("passes the inherited depth cap through to the nested tools", async () => {
@@ -2252,6 +2307,7 @@ describe("agent-runner ext: tool selectors", () => {
     builtinToolNames: string[];
     extSelectors?: string[];
     disallowedTools?: string[];
+    isolated?: boolean | undefined;
   }) {
     vi.mocked(getConfig).mockReturnValueOnce(makeConfig({ extensions: o.extensions }));
     vi.mocked(getAgentConfig).mockReturnValueOnce(
@@ -2259,6 +2315,7 @@ describe("agent-runner ext: tool selectors", () => {
         extensions: o.extensions,
         extSelectors: o.extSelectors,
         disallowedTools: o.disallowedTools,
+        ...("isolated" in o ? { isolated: o.isolated } : {}),
       }),
     );
     vi.mocked(getToolNamesForType).mockReturnValueOnce(o.builtinToolNames);
@@ -2387,7 +2444,7 @@ describe("agent-runner ext: tool selectors", () => {
   });
 
   it("isolated: true ignores extSelectors — no extension tools", async () => {
-    setupExtAgent({ extensions: true, builtinToolNames: ["read"], extSelectors: ["ext:foo"] });
+    setupExtAgent({ extensions: true, builtinToolNames: ["read"], extSelectors: ["ext:foo"], isolated: undefined });
     withExtensions({ "/ext/foo.ts": ["foo_tool"] });
     const { session } = createSession("OK");
     createAgentSession.mockResolvedValue({ session });

@@ -13,6 +13,8 @@
  * completion-notification race, and what protocol version 2 does not promise.
  */
 
+import { getAgentConfig } from "./agent-types.js";
+import { selectExact } from "./exact-selection.js";
 import { isTopLevelAgent } from "./agent-manager.js";
 import { type ModelRegistry, resolveModel } from "./model-resolver.js";
 import { checkModelScope } from "./model-scope.js";
@@ -113,6 +115,14 @@ export function registerRpcHandlers(deps: RpcDeps): RpcHandle {
       // agent's auth lookup doesn't crash with "No API key found for
       // undefined".
       let normalizedOptions = options ?? {};
+      const config = getAgentConfig(type);
+      if (config?.requireExactSelection) {
+        const { modelRegistry } = ctx as { modelRegistry?: ModelRegistry };
+        if (!modelRegistry) throw new Error("Exact selection requires a model registry");
+        if (normalizedOptions.resumeSessionFile || normalizedOptions.workflowId || normalizedOptions.parentAgentId) throw new Error("Exact-selection roles require a fresh top-level spawn");
+        const selection = selectExact(config, normalizedOptions.model, normalizedOptions.thinkingLevel, modelRegistry);
+        normalizedOptions = { ...normalizedOptions, model: selection.model, thinkingLevel: selection.thinking };
+      }
       // `!= null` on purpose: a JSON-forwarding caller can serialize an unset
       // field as null, and the runner reads `options.model ?? default`, so null
       // means "inherit" — not an override to resolve or scope-check.

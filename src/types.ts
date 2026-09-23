@@ -51,6 +51,8 @@ export interface AgentConfig {
   excludeExtensions?: string[];
   /** true = inherit all, string[] = only listed, false = none */
   skills: true | string[] | false;
+  /** Require an exact validated model/effort through Agent or RPC before prompting. */
+  requireExactSelection?: boolean;
   model?: string;
   thinking?: ThinkingLevel;
   maxTurns?: number;

@@ -15,8 +15,9 @@ import {
   type ExtensionAPI,
   getAgentDir,
   SessionManager,
-  SettingsManager,
 } from "@earendil-works/pi-coding-agent";
+import { assertCanResume, assertExactSelection, verifyExactSession } from "./exact-selection.js";
+import { createChildSettings } from "./child-settings.js";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getConfig, getMemoryToolNames, getReadOnlyMemoryToolNames, getToolNamesForType } from "./agent-types.js";
 import { runInChildSessionContext } from "./child-context.js";
 import { buildParentContext, extractText } from "./context.js";
@@ -607,6 +608,48 @@ function resolveConfiguredSessionDir(sessionDir: string | undefined, cwd: string
   return resolve(cwd, sessionDir);
 }
 
+interface WorkerLifecycleController {
+  finishRun?: (runId: string, reason?: string) => void;
+}
+
+const WORKER_LIFECYCLE_SYMBOL = Symbol.for("pi-provider-worker-lifecycle-v1");
+const claudeIsolatedWorkerRuns = new WeakMap<AgentSession, string>();
+
+/** Mark an isolated Claude child for the provider's authenticated ephemeral path. */
+function installClaudeIsolatedWorkerStream(session: AgentSession, model: Model<any> | undefined, isolated: boolean | undefined): void {
+  if (!isolated || model?.provider !== "claude-bridge") return;
+  const runId = session.sessionManager.getSessionId();
+  claudeIsolatedWorkerRuns.set(session, runId);
+  const stream = session.agent.streamFunction;
+  session.agent.streamFunction = (streamModel, context, streamOptions) => stream(streamModel, context, {
+    ...streamOptions,
+    // Compaction and branch-summary calls may supply a fresh session id. Keep
+    // every provider call made by this child authenticated to its stable run.
+    sessionId: runId,
+    metadata: {
+      ...streamOptions?.metadata,
+      "pi.worker.protocol": "1",
+      "pi.worker.kind": "pi-subagent",
+      "pi.worker.stage": "agent",
+      "pi.worker.runId": runId,
+    },
+  });
+}
+
+/** Release a bridge query that may be parked at a tool boundary or turn cap. */
+function finishClaudeIsolatedWorkerRun(session: AgentSession, reason: string): void {
+  const runId = claudeIsolatedWorkerRuns.get(session);
+  if (!runId) return;
+  try {
+    const controller = (globalThis as Record<symbol, unknown>)[WORKER_LIFECYCLE_SYMBOL] as
+      | WorkerLifecycleController
+      | undefined;
+    controller?.finishRun?.(runId, reason);
+  } catch {
+    // Provider lifecycle integration is optional and must not mask run results.
+  }
+}
+
 export async function runAgent(
   ctx: ExtensionContext,
   type: SubagentType,
@@ -615,6 +658,14 @@ export async function runAgent(
 ): Promise<RunResult> {
   const config = getConfig(type);
   const agentConfig = getAgentConfig(type);
+  if (agentConfig?.requireExactSelection) {
+    if (options.workflow || options.nested || options.resumeSessionFile || options.structuredOutput) throw new Error("Exact-selection roles require a fresh plain top-level Agent or RPC spawn");
+    if (agentConfig.isolated !== true || options.isolated === false || agentConfig.inheritContext || options.inheritContext) throw new Error("Exact-selection roles require isolated fresh context");
+    assertExactSelection(agentConfig, options.model, options.thinkingLevel);
+  }
+  // Agent frontmatter is authoritative, matching resolveAgentInvocationConfig.
+  // Workflow-hosted children may arrive without a call-site isolated flag.
+  const isolated = agentConfig?.isolated ?? options.isolated ?? false;
 
   // Resolve working directory: worktree override > parent cwd
   const effectiveCwd = options.cwd ?? ctx.cwd;
@@ -633,11 +684,11 @@ export async function runAgent(
   if (options.workflow && !options.structuredOutput) extras.workflowChild = true;
 
   // Resolve extensions/skills: isolated overrides to false
-  const extensions = options.isolated ? false : config.extensions;
+  const extensions = isolated ? false : config.extensions;
   // Nulling excludes under isolated also suppresses the orphaned-exclude warning —
   // isolation is an intentional override, not a misconfiguration.
-  const excludeExtensions = options.isolated ? undefined : config.excludeExtensions;
-  const skills = options.isolated ? false : config.skills;
+  const excludeExtensions = isolated ? undefined : config.excludeExtensions;
+  const skills = isolated ? false : config.skills;
 
   // Skill preloading: when skills is string[], preload their content into prompt
   if (Array.isArray(skills)) {
@@ -706,7 +757,7 @@ export async function runAgent(
   // which extensions load. `ext:foo` against an extension that `extensions:` excluded
   // is an orphan and warns after reload. `isolated` means no extension tools at all.
   const { extNames, narrowing } = parseExtSelectors(
-    options.isolated ? [] : (agentConfig?.extSelectors ?? []),
+    isolated ? [] : (agentConfig?.extSelectors ?? []),
   );
   const noExtensions = extensions === false;
 
@@ -743,7 +794,12 @@ export async function runAgent(
             }),
           };
         };
+  // Resolve model: explicit option > config.model > parent model
+  const model = options.model ?? resolveDefaultModel(
+    ctx.model, ctx.modelRegistry, agentConfig?.model,
+  );
 
+  
   const loader = new DefaultResourceLoader({
     cwd: configCwd,
     agentDir,
@@ -828,12 +884,7 @@ export async function runAgent(
     }
   }
 
-  // Resolve model: explicit option > config.model > parent model
-  const model = options.model ?? resolveDefaultModel(
-    ctx.model, ctx.modelRegistry, agentConfig?.model,
-  );
-
-  // Resolve thinking level: explicit option > agent config > undefined (inherit)
+// Resolve thinking level: explicit option > agent config > undefined (inherit)
   const thinkingLevel = options.thinkingLevel ?? agentConfig?.thinking;
 
   const disallowedSet = agentConfig?.disallowedTools
@@ -852,7 +903,7 @@ export async function runAgent(
   const nestedRuntime = options.nestedRuntime && options.nestedRuntime.depth < effectiveMaxDepth
     ? options.nestedRuntime
     : undefined;
-  const nestedTools = agentConfig?.allowedSubagents && nestedRuntime && !options.isolated
+  const nestedTools = agentConfig?.allowedSubagents && nestedRuntime && !isolated
     ? createNestedSubagentTools({
         manager: nestedRuntime.manager,
         pi: options.pi,
@@ -952,7 +1003,7 @@ export async function runAgent(
     sessionExcludeTools = [...denyTools];
   }
 
-  const settingsManager = SettingsManager.create(configCwd, agentDir);
+  const settingsManager = createChildSettings(configCwd, agentDir, isolated);
   const configuredSessionDir = resolveConfiguredSessionDir(agentConfig?.sessionDir, effectiveCwd);
   const defaultSessionDir = process.env.PI_CODING_AGENT_SESSION_DIR ?? settingsManager.getSessionDir?.();
   // Frontmatter wins when it says anything; otherwise the project default,
@@ -1006,6 +1057,8 @@ export async function runAgent(
   }
 
   const { session } = await runInChildSessionContext(() => createAgentSession(sessionOpts));
+  if (agentConfig?.requireExactSelection) verifyExactSession(agentConfig, model, thinkingLevel, session);
+  installClaudeIsolatedWorkerStream(session, model, isolated);
 
   const baseSessionName = agentConfig?.name ?? type;
   session.setSessionName(
@@ -1110,6 +1163,7 @@ export async function runAgent(
   const startLen = session.messages.length;
   let structuredRetried = false;
   try {
+    if (agentConfig?.requireExactSelection) verifyExactSession(agentConfig, model, thinkingLevel, session);
     await session.prompt(effectivePrompt);
 
     // One more prompt when a schema was asked for and nothing usable came back
@@ -1123,9 +1177,13 @@ export async function runAgent(
       await session.prompt(structuredRetryPrompt(structuredCapture));
     }
   } finally {
-    unsubTurns();
-    collector.unsubscribe();
-    cleanupAbort();
+    try {
+      unsubTurns();
+      collector.unsubscribe();
+      cleanupAbort();
+    } finally {
+      finishClaudeIsolatedWorkerRun(session, "pi-subagent prompt finished");
+    }
   }
 
   const responseText = collector.getText().trim() || getLastAssistantText(session, startLen);
@@ -1161,6 +1219,7 @@ export async function resumeAgent(
     signal?: AbortSignal;
   } = {},
 ): Promise<{ text: string; failure?: string }> {
+  assertCanResume(session);
   // Boundary for the history fallback: the session already holds prior turns,
   // so only assistant text produced by THIS resume prompt counts as its output
   // — a failed resume must not surface the previous turn's answer (#144).
@@ -1191,9 +1250,15 @@ export async function resumeAgent(
   try {
     await session.prompt(prompt);
   } finally {
-    collector.unsubscribe();
-    unsubEvents();
-    cleanupAbort();
+    try {
+      collector.unsubscribe();
+      unsubEvents();
+      cleanupAbort();
+    } finally {
+      // Deliberately not one-shot: a reusable child can start another bridge
+      // run under the same stable session id on every later resume.
+      finishClaudeIsolatedWorkerRun(session, "pi-subagent resume finished");
+    }
   }
 
   return {
